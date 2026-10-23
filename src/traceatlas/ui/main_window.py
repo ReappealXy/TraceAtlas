@@ -1,4 +1,4 @@
-"""TraceAtlas desktop: projects, real data, background tasks and traceable results."""
+"""TraceAtlas desktop: three layouts over the same real project workflow."""
 
 from __future__ import annotations
 
@@ -6,22 +6,27 @@ import json
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QThreadPool, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDialog,
     QDockWidget,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLayout,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
+    QTabBar,
     QToolBar,
     QTreeWidget,
     QTreeWidgetItem,
@@ -33,7 +38,6 @@ from traceatlas.contracts import TraceAtlasError
 
 from .common import (
     ENUM_LABELS,
-    STYLE,
     BackgroundCall,
     copy_error_report,
     destination_snapshot,
@@ -42,7 +46,27 @@ from .common import (
     show_error,
 )
 from .dialogs import ExportDialog, ImportDialog, NewProjectDialog
+from .home import HomePage
+from .inspector import SourceInspector
+from .settings_dialog import SettingsDialog
 from .sources import SourcesDialog
+from .theme import (
+    DEFAULT_LAYOUT,
+    DEFAULT_THEME,
+    LAYOUT_LABELS,
+    LAYOUTS,
+    THEME_LABELS,
+    THEMES,
+    Tokens,
+    apply_appearance,
+    mono_family,
+    motion_enabled,
+    normalize_layout,
+    normalize_theme,
+    resolve_mode,
+    tokens,
+)
+from .widgets import GridPanel, Sparkline
 
 STATES = {
     "queued": "排队中",
@@ -77,16 +101,97 @@ STAGES = {
 }
 ACTIVE = {"queued", "running", "committing", "cancel_requested"}
 
+PAGE_TABS = ("项目概览", "标准流水", "项目内查找", "模块与能力")
+NAV_WIDTHS = {"folio": 250, "terminal": 208, "network": 234}
+DOCK_TITLES = {"folio": "后台任务 · 记录条", "terminal": "后台任务 · 任务流水", "network": "后台任务 · 任务面板"}
+PAGE_MARGINS = {"folio": (22, 16, 22, 12), "terminal": (14, 8, 14, 8), "network": (18, 14, 18, 12)}
+
+
+def repolish(widget: QWidget) -> None:
+    """Re-apply the application stylesheet after an object name change."""
+    style = widget.style()
+    style.unpolish(widget)
+    style.polish(widget)
+    widget.update()
+
+
+class InstrumentPanel(QWidget):
+    """Terminal layout: real counters and a real current-page amount signal."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("instrumentPanel")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 8, 16, 8)
+        layout.setSpacing(10)
+        self.values: dict[str, QLabel] = {}
+        for key, caption in (
+            ("object", "当前对象"),
+            ("records", "记录"),
+            ("page", "当前页"),
+            ("filters", "筛选"),
+            ("tasks", "后台任务"),
+        ):
+            block = QVBoxLayout()
+            block.setSpacing(0)
+            block.addWidget(self._caption(caption))
+            value = QLabel("—")
+            value.setObjectName("metricValue")
+            if key == "object":
+                value.setMinimumWidth(0)
+                value.setMaximumWidth(140)
+                value.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            block.addWidget(value)
+            layout.addLayout(block, 1 if key == "object" else 0)
+            self.values[key] = value
+        signal = QVBoxLayout()
+        signal.setSpacing(0)
+        signal.addWidget(self._caption("当前页金额分布"))
+        self.sparkline = Sparkline()
+        self.sparkline.setMinimumWidth(60)
+        self.sparkline.setMaximumWidth(260)
+        self.sparkline.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.sparkline.setFixedHeight(54)
+        signal.addWidget(self.sparkline)
+        layout.addLayout(signal, 2)
+
+    @staticmethod
+    def _caption(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("metricLabel")
+        return label
+
+    def set_metrics(self, values: dict[str, str]) -> None:
+        for key, value in values.items():
+            if key in self.values:
+                self.values[key].setText(value)
+                self.values[key].setToolTip(value)
+
+    def set_amounts(self, values: list[float], *, empty_text: str = "当前页没有可绘制的金额") -> None:
+        self.sparkline.set_empty_text(empty_text)
+        self.sparkline.set_values(values)
+
+    def apply_theme(self, scheme: Tokens) -> None:
+        self.sparkline.set_tokens(scheme)
+
+    def clear(self) -> None:
+        for value in self.values.values():
+            value.setText("—")
+        self.sparkline.set_values([])
+
 
 class MainWindow(QMainWindow):
     def __init__(self, project=None):
         super().__init__()
         self.setWindowTitle("TraceAtlas")
         screen = self.screen().availableGeometry()
-        self.resize(min(1360, screen.width() - 40), min(880, screen.height() - 60))
+        self.resize(min(1400, screen.width() - 40), min(900, screen.height() - 60))
         self.setMinimumSize(1000, 680)
-        self.setStyleSheet(STYLE)
         self.settings = QSettings("TraceAtlas", "TraceAtlas")
+        self.layout_id = normalize_layout(self.settings.value("ui/layout", DEFAULT_LAYOUT))
+        self.theme_setting = normalize_theme(self.settings.value("ui/theme", DEFAULT_THEME))
+        self.motion_paused = _as_bool(self.settings.value("ui/motion_paused", False))
+        self._scheme: Tokens = tokens(self.layout_id, resolve_mode(self.theme_setting))
         self.project = None
         self.manager = None
         self.query = None
@@ -104,11 +209,20 @@ class MainWindow(QMainWindow):
         self._task_snapshot = None
         self._deferred = None
         self._closing = False
+        self._syncing_tabs = False
+        self._finished_ids = set()
+        self._latest_task = None
+        self._notice_text = ""
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(2)
         self._create_actions()
         self._create_shell()
         self._create_tasks()
+        self._apply_layout(self.layout_id, persist=False)
+        self._refresh_actions()
+        self._mode_label = QLabel("")
+        self._mode_label.setObjectName("muted")
+        self.statusBar().addPermanentWidget(self._mode_label)
         self.statusBar().showMessage("本机项目 · 完成的操作自动保存")
         self.timer = QTimer(self)
         self.timer.setInterval(200)
@@ -116,12 +230,12 @@ class MainWindow(QMainWindow):
         self.timer.start()
         if project is not None:
             self.set_project(project)
-        else:
-            self._refresh_actions()
+        self._watch_system_theme()
         geometry = self.settings.value("window/geometry")
         if geometry:
             self.restoreGeometry(geometry)
 
+    # -- construction ---------------------------------------------------
     def _action(self, name, slot, shortcut=None):
         action = QAction(name, self)
         action.triggered.connect(slot)
@@ -142,7 +256,10 @@ class MainWindow(QMainWindow):
         self.delete_action = self._action("删除当前结果…", self.delete_result)
         self.cleanup_action = self._action("清理中断任务的临时文件…", self.cleanup)
         self.rebuild_action = self._action("重建项目内索引", self.rebuild_index)
+        self.settings_action = self._action("设置…", self.open_settings, "Ctrl+,")
+        self.search_action = self._action("查找最近项目", self.focus_home_search, "Ctrl+K")
         self.quit_action = self._action("退出", self.close, QKeySequence.StandardKey.Quit)
+
         project_menu = self.menuBar().addMenu("项目")
         for action in (self.new_action, self.open_action):
             project_menu.addAction(action)
@@ -153,6 +270,7 @@ class MainWindow(QMainWindow):
             project_menu.addAction(action)
         project_menu.addSeparator()
         project_menu.addAction(self.quit_action)
+
         data_menu = self.menuBar().addMenu("数据")
         for action in (
             self.import_action,
@@ -164,8 +282,42 @@ class MainWindow(QMainWindow):
             self.rebuild_action,
         ):
             data_menu.addAction(action)
+
+        view_menu = self.menuBar().addMenu("视图")
+        self.view_menu = view_menu
+        self.layout_menu = view_menu.addMenu("工作界面布局")
+        self.layout_group = QActionGroup(self)
+        self.layout_group.setExclusive(True)
+        self.layout_actions: dict[str, QAction] = {}
+        for layout in LAYOUTS:
+            action = QAction(f"{LAYOUT_LABELS[layout]}", self, checkable=True)
+            action.setChecked(layout == self.layout_id)
+            action.triggered.connect(lambda _=False, value=layout: self.set_layout(value))
+            self.layout_group.addAction(action)
+            self.layout_menu.addAction(action)
+            self.layout_actions[layout] = action
+        self.theme_menu = view_menu.addMenu("主题")
+        self.theme_group = QActionGroup(self)
+        self.theme_group.setExclusive(True)
+        self.theme_actions: dict[str, QAction] = {}
+        for theme in THEMES:
+            action = QAction(THEME_LABELS[theme], self, checkable=True)
+            action.setChecked(theme == self.theme_setting)
+            action.triggered.connect(lambda _=False, value=theme: self.set_theme(value))
+            self.theme_group.addAction(action)
+            self.theme_menu.addAction(action)
+            self.theme_actions[theme] = action
+        self.motion_action = QAction("暂停界面动效", self, checkable=True)
+        self.motion_action.setChecked(self.motion_paused)
+        self.motion_action.triggered.connect(self.set_motion_paused)
+        view_menu.addAction(self.motion_action)
+        view_menu.addSeparator()
+        view_menu.addAction(self.search_action)
+        view_menu.addAction(self.settings_action)
+
         help_menu = self.menuBar().addMenu("帮助")
         help_menu.addAction(self._action("关于 TraceAtlas", self.about))
+
         toolbar = QToolBar("常用操作", self)
         toolbar.setMovable(False)
         for action in (self.new_action, self.open_action, self.save_action):
@@ -173,13 +325,16 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         for action in (self.import_action, self.count_action, self.export_action):
             toolbar.addAction(action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.settings_action)
         self.addToolBar(toolbar)
 
     def _create_shell(self):
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        navigation = QWidget()
-        nav_layout = QVBoxLayout(navigation)
-        nav_layout.setContentsMargins(16, 18, 12, 12)
+        self.nav_root = QWidget()
+        self.nav_root.setObjectName("navRoot")
+        nav_layout = QVBoxLayout(self.nav_root)
+        nav_layout.setContentsMargins(16, 16, 12, 12)
+        nav_layout.setSpacing(6)
         brand = QLabel("TraceAtlas")
         brand.setObjectName("pageTitle")
         nav_layout.addWidget(brand)
@@ -194,77 +349,118 @@ class MainWindow(QMainWindow):
         self.navigation = QTreeWidget()
         self.navigation.setObjectName("navigation")
         self.navigation.setHeaderHidden(True)
-        self.navigation.setMinimumWidth(230)
+        self.navigation.setMinimumWidth(180)
         self.navigation.itemSelectionChanged.connect(self._navigate)
         nav_layout.addWidget(self.navigation, 1)
-        splitter.addWidget(navigation)
+        self.nav_settings_button = QPushButton("设置与外观…")
+        self.nav_settings_button.setObjectName("quiet")
+        self.nav_settings_button.clicked.connect(self.open_settings)
+        nav_layout.addWidget(self.nav_settings_button)
+
         self.workspace = QStackedWidget()
         self.workspace.setObjectName("workspace")
-        self.welcome_page = self._welcome()
-        self.workspace.addWidget(self.welcome_page)
+        self.home = HomePage()
+        self.welcome_page = self.home
+        self.workspace.addWidget(self.home)
         self.data_page = self._data_page()
         self.workspace.addWidget(self.data_page)
         self.index_page = self._index_page()
         self.workspace.addWidget(self.index_page)
         self.modules_page = self._modules_page()
         self.workspace.addWidget(self.modules_page)
-        splitter.addWidget(self.workspace)
-        splitter.setSizes([270, 1090])
-        self.setCentralWidget(splitter)
-        self._populate_navigation()
 
-    def _welcome(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(38, 36, 38, 28)
-        title = QLabel("从一个项目开始")
-        title.setObjectName("pageTitle")
-        layout.addWidget(title)
-        self.welcome_text = QLabel(
-            "把原始文件、数据版本和分析结果放在同一个项目里。\n每个结果都能回到参与计算的原始记录。"
-        )
-        self.welcome_text.setWordWrap(True)
-        layout.addWidget(self.welcome_text)
-        layout.addSpacing(18)
-        actions = QHBoxLayout()
-        self.welcome_new = QPushButton("新建项目")
-        self.welcome_new.setObjectName("primary")
-        self.welcome_new.clicked.connect(self.new_project)
-        self.welcome_open = QPushButton("打开已有项目")
-        self.welcome_open.clicked.connect(self.choose_project)
-        self.welcome_import = QPushButton("导入第一份 Excel")
-        self.welcome_import.setObjectName("primary")
-        self.welcome_import.clicked.connect(self.import_data)
-        actions.addWidget(self.welcome_new)
-        actions.addWidget(self.welcome_open)
-        actions.addWidget(self.welcome_import)
-        actions.addStretch()
-        layout.addLayout(actions)
-        layout.addSpacing(30)
-        self.overview = QLabel("当前可用：Excel 导入、按账户计数、来源追溯、查询导出和项目内索引。")
-        self.overview.setWordWrap(True)
-        self.overview.setObjectName("muted")
-        layout.addWidget(self.overview)
-        self.recovery_notice = QLabel()
-        self.recovery_notice.setWordWrap(True)
-        self.recovery_notice.setObjectName("notice")
-        self.recovery_notice.hide()
-        layout.addWidget(self.recovery_notice)
-        layout.addStretch()
-        return page
+        center = QWidget()
+        self.center = center
+        center_layout = QVBoxLayout(center)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(0)
+        self.instrument = InstrumentPanel()
+        center_layout.addWidget(self.instrument)
+        self.notice_label = QLabel()
+        self.notice_label.setObjectName("notice")
+        self.notice_label.setWordWrap(True)
+        self.notice_label.hide()
+        center_layout.addWidget(self.notice_label)
+        self.page_tabs = QTabBar()
+        self.page_tabs.setObjectName("pageTabs")
+        self.page_tabs.setExpanding(False)
+        for title in PAGE_TABS:
+            self.page_tabs.addTab(title)
+        self.page_tabs.setCurrentIndex(0)
+        self.page_tabs.currentChanged.connect(self._tab_selected)
+        self.workspace.currentChanged.connect(self._sync_page_tabs)
+        self.workspace.currentChanged.connect(self._update_inspector_visibility)
+        center_layout.addWidget(self.page_tabs)
+        self.workspace_backdrop = GridPanel()
+        backdrop_layout = QVBoxLayout(self.workspace_backdrop)
+        backdrop_layout.setContentsMargins(0, 0, 0, 0)
+        backdrop_layout.addWidget(self.workspace)
+        center_layout.addWidget(self.workspace_backdrop, 1)
+        self.log_line = QLabel("")
+        self.log_line.setObjectName("logLine")
+        self.log_line.setContentsMargins(16, 4, 16, 6)
+        center_layout.addWidget(self.log_line)
+
+        self.inspector = SourceInspector()
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setObjectName("shellSplitter")
+        self.splitter.addWidget(self.nav_root)
+        self.splitter.addWidget(center)
+        self.splitter.addWidget(self.inspector)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setStretchFactor(2, 0)
+        self.splitter.setSizes([NAV_WIDTHS[self.layout_id], 900, 300])
+        self.setCentralWidget(self.splitter)
+
+        self.home.newProjectRequested.connect(self.new_project)
+        self.home.openProjectRequested.connect(self.choose_project)
+        self.home.continueProjectRequested.connect(self.continue_project)
+        self.home.projectRequested.connect(self.open_project)
+        self.home.importRequested.connect(self.import_data)
+        self.home.resumeRequested.connect(self.return_to_workspace)
+        self.home.settingsRequested.connect(self.open_settings)
+        self.home.layoutRequested.connect(self.set_layout)
+        self.inspector.sourcesRequested.connect(self.show_sources)
+        self.inspector.qualityRequested.connect(self.show_quality)
+        self._populate_navigation()
+        self._refresh_home()
 
     def _data_page(self):
+        scroll = QScrollArea()
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
         page = QWidget()
+        page.setObjectName("pageSurface")
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(22, 20, 22, 16)
-        self.data_title = QLabel("数据")
-        self.data_title.setObjectName("pageTitle")
-        layout.addWidget(self.data_title)
+        self.data_layout = layout
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        page.setMinimumWidth(580)
+        layout.setContentsMargins(*PAGE_MARGINS[self.layout_id])
+        layout.setSpacing(7)
+        header = QHBoxLayout()
+        title_column = QVBoxLayout()
+        title_column.setSpacing(2)
+        self.data_object_name = QLabel("数据")
+        self.data_object_name.setObjectName("pageTitle")
+        self.data_object_name.setWordWrap(True)
+        title_column.addWidget(self.data_object_name)
         self.data_summary = QLabel()
         self.data_summary.setWordWrap(True)
         self.data_summary.setObjectName("muted")
-        layout.addWidget(self.data_summary)
+        title_column.addWidget(self.data_summary)
+        header.addLayout(title_column, 1)
+        self.data_import_button = QPushButton("导入数据")
+        self.data_import_button.clicked.connect(self.import_data)
+        self.data_source_button = QPushButton("查看来源")
+        self.data_source_button.clicked.connect(self.show_sources)
+        self.data_export_button = QPushButton("导出…")
+        self.data_export_button.clicked.connect(self.export_data)
+        for button in (self.data_import_button, self.data_source_button, self.data_export_button):
+            header.addWidget(button)
+        layout.addLayout(header)
         filter_row = QHBoxLayout()
+        filter_row.setSpacing(6)
         self.filter_column = QComboBox()
         self.filter_column.setObjectName("filterColumn")
         self.filter_column.setMinimumWidth(130)
@@ -310,6 +506,7 @@ class MainWindow(QMainWindow):
             self.clear_filters_button,
         ):
             filter_row.addWidget(widget)
+        filter_row.addStretch(1)
         layout.addLayout(filter_row)
         layout.addWidget(self.time_filter_note)
         self.filter_summary = QLabel("显示全部记录 · 点击列标题排序")
@@ -318,10 +515,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.filter_summary)
         self.table, self.table_model = make_table()
         self.table.setObjectName("dataTable")
+        self.table.setMinimumHeight(180)
         self.table.horizontalHeader().setSectionsClickable(True)
         self.table.horizontalHeader().sectionClicked.connect(self.sort_column)
         self.table.doubleClicked.connect(self.show_sources)
-        self.table.selectionModel().selectionChanged.connect(self._refresh_actions)
+        self.table.selectionModel().selectionChanged.connect(self._on_row_selection)
         layout.addWidget(self.table, 1)
         row = QHBoxLayout()
         self.previous_page = QPushButton("上一页")
@@ -342,17 +540,20 @@ class MainWindow(QMainWindow):
         export.clicked.connect(self.export_data)
         row.addWidget(export)
         layout.addLayout(row)
-        return page
+        scroll.setWidget(page)
+        return scroll
 
     def _index_page(self):
         page = QWidget()
+        page.setObjectName("pageSurface")
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(22, 20, 22, 16)
+        layout.setContentsMargins(*PAGE_MARGINS[self.layout_id])
         title = QLabel("项目内查找")
         title.setObjectName("pageTitle")
         layout.addWidget(title)
         note = QLabel("在当前项目已登记的本方 / 对方账户中查找。索引保留数据版本和原始行定位。")
         note.setWordWrap(True)
+        note.setObjectName("muted")
         layout.addWidget(note)
         row = QHBoxLayout()
         self.index_input = QLineEdit()
@@ -394,32 +595,35 @@ class MainWindow(QMainWindow):
 
     def _modules_page(self):
         page = QWidget()
+        page.setObjectName("pageSurface")
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(22, 20, 22, 16)
+        layout.setContentsMargins(*PAGE_MARGINS[self.layout_id])
         title = QLabel("模块与能力")
         title.setObjectName("pageTitle")
         layout.addWidget(title)
         note = QLabel("当前已安装的能力及输入要求。已保存的结果保留生成它时的算法版本。")
         note.setWordWrap(True)
+        note.setObjectName("muted")
         layout.addWidget(note)
         self.modules_table, self.modules_model = make_table()
         layout.addWidget(self.modules_table, 1)
         return page
 
     def _create_tasks(self):
-        dock = QDockWidget("后台任务", self)
+        dock = QDockWidget(DOCK_TITLES[self.layout_id], self)
         dock.setObjectName("taskDock")
         dock.setAllowedAreas(Qt.DockWidgetArea.BottomDockWidgetArea)
         dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetClosable)
         widget = QWidget()
+        widget.setObjectName("taskDockBody")
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(8, 6, 8, 8)
         self.tasks_table = QTreeWidget()
         self.tasks_table.setObjectName("taskList")
         self.tasks_table.setHeaderLabels(["任务", "状态", "阶段", "进度", "说明"])
         self.tasks_table.setRootIsDecorated(False)
-        self.tasks_table.setMinimumHeight(100)
-        self.tasks_table.setMaximumHeight(210)
+        self.tasks_table.setMinimumHeight(92)
+        self.tasks_table.setMaximumHeight(132)
         self.tasks_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.tasks_table.itemDoubleClicked.connect(self.task_details)
         self.tasks_table.itemSelectionChanged.connect(self._refresh_task_actions)
@@ -434,16 +638,130 @@ class MainWindow(QMainWindow):
         self.cancel_task_button.clicked.connect(self.cancel_task)
         self.retry_task_button = QPushButton("重试")
         self.retry_task_button.clicked.connect(self.retry_task)
+        for button in (self.cancel_task_button, self.retry_task_button):
+            row.addWidget(button)
         self.task_details_button = QPushButton("详情")
         self.task_details_button.clicked.connect(self.task_details)
-        for button in (self.cancel_task_button, self.retry_task_button, self.task_details_button):
-            row.addWidget(button)
+        row.addWidget(self.task_details_button)
         layout.addLayout(row)
         dock.setWidget(widget)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
-        self.menuBar().addMenu("视图").addAction(dock.toggleViewAction())
+        self.resizeDocks([dock], [148], Qt.Orientation.Vertical)
         self.task_dock = dock
+        self.view_menu_action = dock.toggleViewAction()
+        self.view_menu_action.setText("显示后台任务区")
+        self.view_menu.addAction(self.view_menu_action)
 
+    # -- appearance -----------------------------------------------------
+    def _watch_system_theme(self):
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        hints = app.styleHints() if app is not None else None
+        signal = getattr(hints, "colorSchemeChanged", None)
+        if signal is None:
+            return
+        try:
+            signal.connect(self._system_scheme_changed)
+        except (RuntimeError, TypeError):
+            pass
+
+    def _system_scheme_changed(self, *_args):
+        if self.theme_setting == "system":
+            self._apply_appearance()
+
+    def _apply_appearance(self):
+        mode = resolve_mode(self.theme_setting)
+        self._scheme = apply_appearance(self.layout_id, mode)
+        label = THEME_LABELS[self.theme_setting]
+        self.home.apply_theme(self.layout_id, self._scheme, label)
+        self.home.set_motion(motion_enabled(self.motion_paused))
+        self.inspector.apply_theme(self._scheme)
+        self.instrument.apply_theme(self._scheme)
+        self.workspace_backdrop.set_tokens(self._scheme)
+        family = mono_family(self._scheme)
+        self.table_model.mono_family = family
+        self.index_model.mono_family = family
+        self._sync_appearance_actions()
+        self._update_mode_label()
+
+    def _update_mode_label(self):
+        if getattr(self, "_mode_label", None) is None:
+            return
+        paused = " · 动效暂停" if self.motion_paused else ""
+        self._mode_label.setText(
+            f"{LAYOUT_LABELS[self.layout_id]} · {THEME_LABELS[self.theme_setting]}{paused}"
+        )
+
+    def _sync_appearance_actions(self):
+        for layout, action in getattr(self, "layout_actions", {}).items():
+            action.setChecked(layout == self.layout_id)
+        for theme, action in getattr(self, "theme_actions", {}).items():
+            action.setChecked(theme == self.theme_setting)
+        if hasattr(self, "motion_action"):
+            self.motion_action.setChecked(self.motion_paused)
+
+    def set_layout(self, layout: str):
+        self._apply_layout(layout)
+
+    def _apply_layout(self, layout: str, *, persist: bool = True):
+        layout = normalize_layout(layout)
+        self.layout_id = layout
+        self.instrument.setVisible(layout == "terminal")
+        self.log_line.setVisible(layout == "terminal")
+        self.workspace_backdrop.set_grid_visible(layout == "network")
+        target = "boxedTab" if layout == "folio" else "pageTabs"
+        if self.page_tabs.objectName() != target:
+            self.page_tabs.setObjectName(target)
+            repolish(self.page_tabs)
+        self.page_tabs.setDrawBase(layout == "folio")
+        self.nav_root.setMinimumWidth(0)
+        self.navigation.setMinimumWidth(NAV_WIDTHS[layout] - 40)
+        self.task_dock.setWindowTitle(DOCK_TITLES[layout])
+        for page in (self.index_page, self.modules_page):
+            page.layout().setContentsMargins(*PAGE_MARGINS[layout])
+        self.data_layout.setContentsMargins(*PAGE_MARGINS[layout])
+        self.home.set_layout(layout)
+        self.splitter.setSizes([NAV_WIDTHS[layout], 900, 300])
+        self._update_inspector_visibility()
+        self._apply_appearance()
+        self._update_metrics()
+        if persist:
+            self.settings.setValue("ui/layout", layout)
+            self.statusBar().showMessage(f"工作界面已切换为{LAYOUT_LABELS[layout]}", 4000)
+
+    def set_theme(self, theme: str):
+        self.theme_setting = normalize_theme(theme)
+        self.settings.setValue("ui/theme", self.theme_setting)
+        self._apply_appearance()
+        self.statusBar().showMessage(f"主题：{THEME_LABELS[self.theme_setting]}", 4000)
+
+    def set_motion_paused(self, paused: bool):
+        self.motion_paused = bool(paused)
+        self.settings.setValue("ui/motion_paused", self.motion_paused)
+        # Motion does not change colours, so avoid a full stylesheet re-polish.
+        self.home.set_motion(motion_enabled(self.motion_paused))
+        self.motion_action.setChecked(self.motion_paused)
+        self._update_mode_label()
+        self.statusBar().showMessage("界面动效已暂停" if self.motion_paused else "界面动效已恢复", 4000)
+
+    def open_settings(self):
+        dialog = SettingsDialog(
+            self.layout_id, self.theme_setting, self.motion_paused, self.settings, self
+        )
+        dialog.layoutChanged.connect(self.set_layout)
+        dialog.themeChanged.connect(self.set_theme)
+        dialog.motionChanged.connect(self.set_motion_paused)
+        self._dialogs.append(dialog)
+        dialog.exec()
+
+    def _update_inspector_visibility(self):
+        on_home = self.workspace.currentWidget() is self.home
+        self.inspector.setVisible(not on_home)
+        self.inspector.set_object(self.current_object)
+        self.inspector.set_row(self._current_row() if self.current_object else None)
+
+    # -- recent projects and home ---------------------------------------
     def _run(self, function, ready, *, title="操作失败", error_handler=None):
         job = BackgroundCall(function)
         self._jobs.add(job)
@@ -468,6 +786,63 @@ class MainWindow(QMainWindow):
         stored = self.settings.value("projects/recent", [])
         return stored if isinstance(stored, list) else [stored] if stored else []
 
+    def recent_projects(self) -> list[dict]:
+        entries = []
+        for path in self._recent():
+            folder = Path(path)
+            entries.append(
+                {
+                    "path": str(folder),
+                    "name": folder.name or str(folder),
+                    "meta": str(folder.parent) + ("" if folder.is_dir() else " · 位置已找不到"),
+                }
+            )
+        return entries
+
+    def _refresh_home(self):
+        self.home.set_projects(self.recent_projects())
+        self.home.set_context(
+            has_project=self.project is not None,
+            writable=self.project is not None and not self.project.readonly,
+            current_name=self.project.name if self.project is not None else "",
+        )
+
+    def _set_notice(self, text: str):
+        self._notice_text = text
+        self.notice_label.setText(text)
+        self.notice_label.setVisible(bool(text))
+        self.home.set_notice(text)
+
+    def focus_home_search(self):
+        if self.workspace.currentWidget() is not self.home:
+            self.workspace.setCurrentWidget(self.home)
+            self._sync_page_tabs()
+        self.home.focus_search()
+
+    def continue_project(self):
+        projects = self.recent_projects()
+        if not projects:
+            self.statusBar().showMessage("还没有最近项目，请先新建或打开一个项目。", 6000)
+            return
+        target = projects[0]
+        if not Path(target["path"]).is_dir():
+            show_error(
+                self,
+                "上次项目不在原位置",
+                f"找不到：{target['path']}\n项目可能被移动或删除。可以用“打开项目”重新选择它的文件夹。",
+            )
+            return
+        self.open_project(target["path"])
+
+    def return_to_workspace(self):
+        if self.project is None:
+            return
+        if self.current_object is not None:
+            self.workspace.setCurrentWidget(self.data_page)
+        else:
+            self.workspace.setCurrentWidget(self.home)
+        self._sync_page_tabs()
+
     def _refresh_recent_menu(self):
         self.recent_menu.clear()
         paths = self._recent()
@@ -476,6 +851,7 @@ class MainWindow(QMainWindow):
             action = self.recent_menu.addAction(str(path))
             action.triggered.connect(lambda checked=False, value=path: self.open_project(value))
 
+    # -- project lifecycle ----------------------------------------------
     def set_project(self, project):
         from traceatlas.query import QueryService
         from traceatlas.tasks import TaskManager
@@ -494,24 +870,20 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{project.name}{suffix} — TraceAtlas")
         self.project_label.setText(project.name + suffix)
         self.project_path_label.setText(str(project.path))
-        self.welcome_text.setText(
-            "导入 Excel 后，可以按账户统计记录数、查看来源并导出。\n已完成的操作会自动保存，关闭后可继续查看。"
-        )
         report = getattr(project, "recovery_report", [])
-        self.recovery_notice.setVisible(bool(report) or project.readonly)
-        self.recovery_notice.setText(
-            "\n".join(
-                (["项目以只读方式打开，可以查看已提交的数据和结果。"] if project.readonly else [])
-                + [str(line) for line in report]
-            )
+        notice = "\n".join(
+            (["项目以只读方式打开，可以查看已提交的数据和结果，不能运行新任务。"] if project.readonly else [])
+            + [str(line) for line in report]
         )
+        self._set_notice(notice)
         paths = [str(project.path)] + [value for value in self._recent() if value != str(project.path)]
         self.settings.setValue("projects/recent", paths[:10])
         self._refresh_recent_menu()
         self._populate_navigation()
         self._load_modules()
         self._refresh_actions()
-        self.workspace.setCurrentWidget(self.welcome_page)
+        self.workspace.setCurrentWidget(self.home)
+        self._sync_page_tabs()
         session = project.load_session()
         selected = session.get("selected_object")
         if selected:
@@ -548,8 +920,10 @@ class MainWindow(QMainWindow):
                 (datasets if obj["kind"] == "dataset" else results).addChild(item)
             datasets.setText(0, f"数据集  {datasets.childCount()}")
             results.setText(0, f"结果  {results.childCount()}")
-            self.overview.setText(
-                f"本项目有 {datasets.childCount()} 个数据版本、{results.childCount()} 份结果。原文件和已提交结果在项目中独立保存。"
+            overview.setToolTip(
+                0,
+                f"本项目有 {datasets.childCount()} 个数据版本、{results.childCount()} 份结果。"
+                "原文件和已提交结果在项目中独立保存。",
             )
         for label, kind in [("项目内查找", "index"), ("模块与能力", "modules")]:
             item = QTreeWidgetItem([label])
@@ -571,7 +945,36 @@ class MainWindow(QMainWindow):
             self._load_modules()
             self.workspace.setCurrentWidget(self.modules_page)
         else:
-            self.workspace.setCurrentWidget(self.welcome_page)
+            self.workspace.setCurrentWidget(self.home)
+        self._sync_page_tabs()
+
+    def _tab_selected(self, index: int):
+        if self._syncing_tabs or index < 0:
+            return
+        if index == 0:
+            self.workspace.setCurrentWidget(self.home)
+        elif index == 1:
+            self.workspace.setCurrentWidget(
+                self.data_page if self.current_object is not None else self.home
+            )
+        elif index == 2:
+            self.workspace.setCurrentWidget(self.index_page)
+        else:
+            self._load_modules()
+            self.workspace.setCurrentWidget(self.modules_page)
+        self._sync_page_tabs()
+
+    def _sync_page_tabs(self, *_args):
+        self._syncing_tabs = True
+        try:
+            current = self.workspace.currentWidget()
+            mapping = {self.home: 0, self.data_page: 1, self.index_page: 2, self.modules_page: 3}
+            self.page_tabs.setCurrentIndex(mapping.get(current, 0))
+            label = "标准流水" if self.current_object is None else self.current_object["name"]
+            self.page_tabs.setTabText(1, label if len(label) <= 18 else label[:17] + "…")
+            self.page_tabs.setTabToolTip(1, label)
+        finally:
+            self._syncing_tabs = False
 
     def _refresh_actions(self, *_):
         writable = self.project is not None and not self.project.readonly
@@ -592,10 +995,15 @@ class MainWindow(QMainWindow):
         has_row = self.current_object is not None and bool(self.table.selectionModel().selectedRows())
         self.source_action.setEnabled(has_row)
         self.source_button.setEnabled(has_row)
-        self.welcome_import.setVisible(self.project is not None)
-        self.welcome_import.setEnabled(writable)
-        self.welcome_new.setVisible(self.project is None)
-        self.welcome_open.setVisible(self.project is None)
+        self.data_source_button.setEnabled(has_row)
+        self.data_export_button.setEnabled(
+            writable and self.current_object is not None and self._query_ready
+        )
+        self.data_import_button.setEnabled(writable)
+        self.inspector.set_actions(has_row=has_row, is_dataset=bool(
+            self.current_object and self.current_object["kind"] == "dataset"
+        ))
+        self._refresh_home()
         self._refresh_task_actions()
 
     def _load_modules(self):
@@ -742,9 +1150,15 @@ class MainWindow(QMainWindow):
         self.project_label.setText("尚未打开项目")
         self.project_path_label.setText("数据保存在你的电脑中")
         self.setWindowTitle("TraceAtlas")
-        self.workspace.setCurrentWidget(self.welcome_page)
+        self._set_notice("")
+        self.inspector.set_object(None)
+        self.instrument.clear()
+        self.log_line.setText("")
+        self.workspace.setCurrentWidget(self.home)
+        self._sync_page_tabs()
         self._populate_navigation()
         self._refresh_actions()
+        self._refresh_home()
 
     def _prepare_switch(self, callback):
         if self._deferred:
@@ -852,7 +1266,7 @@ class MainWindow(QMainWindow):
         self.offset = (restore or {}).get("offset", 0)
         self.total = 0
         self.table_model.replace({})
-        self.data_title.setText(obj["name"])
+        self.data_object_name.setText(obj["name"])
         data = obj["data"]
         summary = f"{'数据版本' if obj['kind'] == 'dataset' else '结果'} · {data.get('row_count', 0):,} 条"
         if obj["kind"] == "dataset":
@@ -867,7 +1281,9 @@ class MainWindow(QMainWindow):
             if data.get("warnings"):
                 summary += "\n" + "；".join(str(value) for value in data["warnings"])
         self.data_summary.setText(summary)
+        self.inspector.set_object(obj)
         self.workspace.setCurrentWidget(self.data_page)
+        self._sync_page_tabs()
         self.load_page()
 
     def load_page(self):
@@ -974,6 +1390,8 @@ class MainWindow(QMainWindow):
             if page["rows"]:
                 self.table.selectRow(0)
             self._refresh_actions()
+            self._on_row_selection()
+            self._update_metrics()
             if self.project and not self.project.readonly:
                 self.project.save_session(self._session())
             self.statusBar().showMessage("查询完成", 2000)
@@ -995,6 +1413,101 @@ class MainWindow(QMainWindow):
             ready,
             error_handler=failed,
         )
+
+    def _current_row(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows or not self.table_model.rows:
+            return None
+        index = rows[0].row()
+        return self.table_model.rows[index] if index < len(self.table_model.rows) else None
+
+    def _on_row_selection(self, *_args):
+        self.inspector.set_row(self._current_row())
+        self._refresh_actions()
+
+    def _update_metrics(self):
+        if not hasattr(self, "instrument"):
+            return
+        obj = self.current_object
+        rows = len(self.table_model.rows)
+        pages = max(1, (self.total + self.page_size - 1) // self.page_size) if self.total else 0
+        page_number = (self.offset // self.page_size + 1) if self.total else 0
+        running = 0
+        if self.manager is not None:
+            try:
+                running = sum(
+                    1 for task in self.manager.list_tasks() if task.get("state") in ACTIVE
+                )
+            except Exception:  # noqa: BLE001 - counters never block the window
+                running = 0
+        self.instrument.set_metrics(
+            {
+                "object": (obj["name"] if obj else "—"),
+                "records": (f"{self.total:,}" if self.total else "0") if obj else "—",
+                "page": f"{page_number}/{pages}" if pages else "—",
+                "filters": f"{len(self.filters)} 条" if obj else "—",
+                "tasks": f"{running} 运行中",
+            }
+        )
+        amounts = []
+        for row in self.table_model.rows[:200]:
+            value = row.get("amount")
+            if value is None:
+                continue
+            try:
+                amounts.append(float(str(value)))
+            except (TypeError, ValueError):
+                continue
+        self.instrument.set_amounts(
+            amounts,
+            empty_text="尚未打开数据" if obj is None else "当前页没有可绘制的金额",
+        )
+        self._update_log_line(rows)
+
+    @staticmethod
+    def _task_summary(task: dict) -> str:
+        state = task.get("state", task.get("status", ""))
+        feature = task.get("feature_id", "")
+        summary = task.get("summary") or {}
+        if state == "succeeded":
+            if feature == "xlsx.import":
+                return f"已导入 {summary.get('row_count', 0):,} 条，错误行 {summary.get('rejected_count', 0):,} 条"
+            if feature == "validation.account_count":
+                return (
+                    f"{summary.get('contributing_count', 0):,} 条记录 → "
+                    f"{summary.get('row_count', 0):,} 个账户"
+                )
+            if feature == "result.export":
+                return f"已导出到 {task.get('parameters', {}).get('destination', '')}"
+            return "项目内索引已保存"
+        error = task.get("error") or {}
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])
+        return str(task.get("message", "") or "")
+
+    def _update_log_line(self, rows: int | None = None):
+        if not hasattr(self, "log_line"):
+            return
+        task = self._latest_task
+        if task:
+            state = task.get("state", task.get("status", ""))
+            stage = task.get("stage", "") or ""
+            detail = self._task_summary(task)
+            text = (
+                f"{FEATURES.get(task.get('feature_id', ''), task.get('feature_id', ''))}"
+                f" · {STATES.get(state, state)}"
+                + (f" · {STAGES.get(stage, stage)}" if stage and state not in ("succeeded",) else "")
+                + (f" · {detail}" if detail else "")
+            )
+        elif self.current_object is not None:
+            text = (
+                f"{'数据' if self.current_object['kind'] == 'dataset' else '结果'}"
+                f" · {self.total:,} 条 · 当前页 {rows if rows is not None else len(self.table_model.rows)} 行"
+                " · 查询与来源在同一条记录链上"
+            )
+        else:
+            text = "本地会话就绪 · 选择项目与数据后开始核查"
+        self.log_line.setText(text)
 
     def add_filter(self):
         column = self.filter_column.currentData()
@@ -1210,8 +1723,10 @@ class MainWindow(QMainWindow):
         try:
             self.project.delete_object(self.current_object["id"])
             self.current_object = None
+            self.inspector.set_object(None)
             self._populate_navigation()
-            self.workspace.setCurrentWidget(self.welcome_page)
+            self.workspace.setCurrentWidget(self.home)
+            self._sync_page_tabs()
             self._refresh_actions()
             self.save_project()
         except Exception as error:  # noqa: BLE001 - user-facing service boundary
@@ -1247,6 +1762,7 @@ class MainWindow(QMainWindow):
             tasks = self.project.list_tasks()
         else:
             tasks = []
+        self._latest_task = tasks[0] if tasks else None
         snapshot = json.dumps(tasks, ensure_ascii=False, default=str, sort_keys=True)
         if snapshot != self._task_snapshot:
             previous_finished = getattr(self, "_finished_ids", set())
@@ -1308,6 +1824,7 @@ class MainWindow(QMainWindow):
                 self._refresh_actions()
                 self.statusBar().showMessage("后台任务已完成，数据和结果已保存。", 7000)
             self._refresh_task_actions()
+            self._update_metrics()
         if (
             self._deferred
             and not self._has_pending_queries()
@@ -1373,7 +1890,8 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "关于 TraceAtlas",
-            "TraceAtlas 0.1.0\n\n本机资金数据分析工作区。\n本版本提供项目保存、Excel 导入、账户计数、来源追溯、查询导出、后台任务和项目内索引。\n\n规模能力以实际测试结果为准。",
+            "TraceAtlas 0.1.0\n\n本机资金数据分析工作区。\n本版本提供项目保存、Excel 导入、账户计数、来源追溯、查询导出、后台任务和项目内索引。\n"
+            "文件册、金融终端、关联画布三种工作界面与默认/亮/暗主题只改变界面组织与颜色，不改变数据与结果。\n\n规模能力以实际测试结果为准。",
         )
 
     def closeEvent(self, event: QCloseEvent):
@@ -1394,3 +1912,9 @@ class MainWindow(QMainWindow):
         self._release_project()
         self.settings.setValue("window/geometry", self.saveGeometry())
         event.accept()
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}

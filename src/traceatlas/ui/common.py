@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QRunnable, Qt, Signal
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QMessageBox, QTableView, QWidget
 
 from traceatlas.contracts import TraceAtlasError
@@ -91,11 +92,20 @@ ENUM_LABELS = {
 }
 
 
+NUMERIC_TYPES = ("integer", "decimal", "number", "int", "int64", "bigint")
+
+
+def is_numeric(column: dict) -> bool:
+    kind = str(column.get("type", "")).lower()
+    return kind in NUMERIC_TYPES or kind.startswith("decimal(")
+
+
 class TableModel(QAbstractTableModel):
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self.columns: list[dict] = []
         self.rows: list[dict] = []
+        self.mono_family = ""
 
     def replace(self, page: dict) -> None:
         self.beginResetModel()
@@ -116,12 +126,16 @@ class TableModel(QAbstractTableModel):
             key = self.columns[index.column()]["key"]
             value = self.rows[index.row()].get(key)
             return ENUM_LABELS.get(key, {}).get(str(value), display(value))
-        if role == Qt.ItemDataRole.TextAlignmentRole:
-            kind = str(self.columns[index.column()].get("type", "")).lower()
-            if kind in ("integer", "decimal", "number", "int", "int64", "bigint") or kind.startswith(
-                "decimal("
-            ):
-                return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if role == Qt.ItemDataRole.TextAlignmentRole and is_numeric(self.columns[index.column()]):
+            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if (
+            role == Qt.ItemDataRole.FontRole
+            and self.mono_family
+            and is_numeric(self.columns[index.column()])
+        ):
+            font = QFont(self.mono_family)
+            font.setStyleHint(QFont.StyleHint.Monospace)
+            return font
         return None
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
@@ -174,33 +188,3 @@ def show_error(parent: QWidget, title: str, error: Exception | str) -> None:
     if details:
         box.setDetailedText(display(details))
     box.exec()
-
-
-STYLE = """
-QMainWindow, QDialog { background: #f5f6f7; }
-QWidget { font-family: 'Microsoft YaHei UI', 'Segoe UI'; font-size: 10pt; color: #243039; }
-QMenuBar, QToolBar { background: #ffffff; border-bottom: 1px solid #d9dfe3; }
-QToolBar { padding: 6px 8px; spacing: 8px; }
-QToolButton { padding: 6px 9px; border-radius: 3px; }
-QToolButton:hover { background: #e6f2ee; }
-QLabel#pageTitle { font-size: 18pt; font-weight: 600; color: #183c35; }
-QLabel#sectionTitle { font-size: 12pt; font-weight: 600; }
-QLabel#muted { color: #596870; }
-QLabel#notice { background: #fff4d6; border: 1px solid #e0ce96; padding: 9px; color: #654e13; }
-QPushButton { background: #ffffff; border: 1px solid #b6c2c8; border-radius: 4px; padding: 6px 12px; }
-QPushButton:hover { border-color: #237b65; background: #edf7f3; }
-QPushButton:default, QPushButton#primary { color: white; background: #17654f; border-color: #17654f; }
-QPushButton:disabled { color: #8a9499; background: #edf0f2; border-color: #d8dfe2; }
-QLineEdit, QComboBox, QSpinBox { background: #ffffff; border: 1px solid #b8c5cb; border-radius: 3px; padding: 5px; min-height: 20px; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #19775d; }
-QTableView, QTreeWidget, QListWidget { background: #ffffff; alternate-background-color: #f5f8f9; border: 1px solid #d8dfe3; selection-background-color: #d8eee6; selection-color: #143f32; gridline-color: #e5eaed; }
-QTreeWidget::item { padding: 8px 4px; }
-QHeaderView::section { background: #edf1f3; color: #35434d; padding: 7px; border: 0; border-right: 1px solid #d8dfe3; border-bottom: 1px solid #d1d9de; }
-QTabWidget::pane { border: 1px solid #d8dfe3; background: white; }
-QTabBar::tab { background: #e9eef0; padding: 8px 18px; }
-QTabBar::tab:selected { background: white; color: #17654f; }
-QStatusBar { background: white; border-top: 1px solid #d8dfe3; color: #52616a; }
-QProgressBar { border: 1px solid #c8d3d9; border-radius: 3px; background: #edf1f3; text-align: center; }
-QProgressBar::chunk { background: #237b65; }
-QDockWidget::title { padding: 7px; background: #e9eef0; font-weight: 600; }
-"""
